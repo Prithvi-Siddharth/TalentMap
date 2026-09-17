@@ -1,97 +1,88 @@
-# TalentMap — Resume Analysis Pipeline & AI Platform
+# TalentMap — AI-Powered Resume-to-Job Matching Platform
 
-TalentMap is a modular, AI-powered system that analyzes resumes, extracts entities (skills, education, experience), matches candidates to job descriptions, and predicts job roles and salary bands.
-
-This repository is structured as an architectural blueprint, containing commented skeleton files that explain every component in detail.
+TalentMap analyzes a user's resume with an LLM, then continuously scans real job postings and scores them against that resume using semantic (embedding-based) similarity — so instead of a user manually re-searching job boards, an agent searches on their behalf and surfaces (and emails) the best real fits as they appear.
 
 ---
 
-## Folder Architecture
+## Architecture
+
+The app is **two independent processes that only communicate through MongoDB** — neither ever calls the other directly:
+
+```
+┌────────────────────┐         ┌──────────────────────────┐
+│   app/main.py        │         │       worker.py            │
+│   (FastAPI web app)  │ ◄─────► │  (APScheduler worker)      │
+│                       │ MongoDB │                             │
+│ auth · upload/analyze │  only   │ fetch jobs (Adzuna +       │
+│ dashboard · history   │         │ RemoteOK) → match every    │
+│ matches · settings    │         │ user → send digest email   │
+└────────────────────┘         └──────────────────────────┘
+```
+
+This split is deliberate: the scheduler used to run inside FastAPI's own lifespan, which meant every dev reload, redeploy, or crash of the API killed the background job scan along with it. Splitting them means the API can restart freely (that's normal/healthy for a web process) without ever interrupting an in-progress scan, and the heavy embedding/matching work never competes with live HTTP request handling. A Mongo-based leader lock (with a TTL-based auto-expiring claim) makes it safe to accidentally run more than one worker instance at once — only one actually does the work.
+
+---
+
+## How it actually works
+
+1. **Upload** — resume PDF goes to AWS S3; a small metadata record (owner, filename, S3 key) goes to MongoDB. Only one resume is ever "active" per user.
+2. **Analyze** — triggered automatically right after upload: `pdfplumber` extracts raw text, which is sent to **Groq** (running Llama 3.3 70B) to extract structured entities — skills, education, experience, projects, certifications — as JSON. Results save immediately; matching against the job pool kicks off as a background task so the response isn't blocked (a full pass against a large pool measured 382s before embedding caching was added).
+3. **Job sourcing** (worker, on a fixed interval) — fetches postings from **Adzuna** (quota-limited, so search terms are derived from users' actual resume titles) and **RemoteOK** (free, unlimited), normalizes both into one schema, and runs each posting through a deterministic keyword/regex entity extractor (vocab lives in `config/*.json`).
+4. **Matching** — resume and job postings are each broken into 4 components (skills/experience/education/certifications), embedded with a **BGE sentence-transformer** (`bge-base-en-v1.5`), and compared with weighted cosine similarity (skills 40%, experience 30%, education 15%, certifications 15%). A component missing on either side is excluded from the score entirely rather than penalized to 0. Job embeddings are cached on first score and reused across every user and cycle.
+5. **Notifications** — per-user configurable (immediate / daily / weekly / never), sent through a fallback chain: Resend → Brevo → SMTP.
+6. **Everything else** (dashboard, matches list, market trends, activity feed, agent status) is server-rendered as an empty shell and hydrated client-side from JSON APIs — the JWT lives in `localStorage`, not a cookie, so there's nothing to render server-side on a plain page load.
+
+---
+
+## Folder structure (as actually built)
 
 ```
 TalentMap/
 ├── app/
-│   ├── main.py                 # FastAPI app entrypoint
-│   ├── config.py               # Environment variable loader (Pydantic BaseSettings)
+│   ├── main.py                    # FastAPI entrypoint — registers routers, mounts /static
+│   ├── config.py                  # Pydantic BaseSettings — one source of truth for env vars
 │   │
-│   ├── api/
-│   │   ├── routes_resume.py     # Endpoint: POST /upload-resume (S3 & MongoDB storage)
-│   │   ├── routes_analyze.py    # Endpoint: POST /analyze (Runs parser -> NLP -> ML predictions)
-│   │   └── routes_history.py    # Endpoint: GET /history/{user_id} (Retrieves historical results)
-│   │
-│   ├── core/
-│   │   ├── s3_utils.py          # Boto3 S3 upload/download helper scripts
-│   │   ├── db.py                # MongoDB connection initializations & collections
-│   │   └── security.py          # JWT user authorization functions (optional)
-│   │
-│   ├── nlp/
-│   │   ├── pdf_parser.py        # PDF binary to plain text extractor
-│   │   ├── preprocess.py        # Text cleaning, normalization, tokenization
-│   │   ├── ner_extractor.py     # Named Entity Recognition (spaCy) for skills, education, and experience
-│   │   └── embeddings.py        # TF-IDF / BERT vectorization and Cosine Similarity calculation
-│   │
-│   ├── ml/
-│   │   ├── train_role_model.py  # Script training the job role classification model
-│   │   ├── train_salary_model.py# Script training the salary estimation regressor model
-│   │   ├── predict.py           # Loads models (local/S3) and runs inference
-│   │   └── models/              # Gitignored folder holding trained binary (.joblib / .pkl) files
-│   │
-│   └── schemas/
-│       ├── resume_schema.py     # Pydantic models validating upload payloads
-│       └── result_schema.py     # Pydantic models validating analysis results
+│   ├── routers/                   # auth, pages, dashboard/settings/activity/market-trends APIs
+│   ├── step1_api/                 # upload_resume, analyze, resume history endpoints
+│   ├── step2_nlp/                 # pdf_parser, preprocess, Groq-based NER, BGE embeddings
+│   ├── step4_agent/                # job fetchers (Adzuna/RemoteOK), matcher, scheduler, email
+│   ├── services/                  # dashboard/market-trends data aggregation, settings, activity log
+│   ├── schemas/                   # Pydantic request/response models
+│   ├── core/                      # db.py (Mongo + indexes), s3_utils, security (JWT), templates
+│   └── tasks/, database/          # earlier Celery/Redis-based scheduler attempt — superseded by
+│                                   # worker.py + APScheduler; not wired into anything running
 │
-├── dashboard/
-│   └── streamlit_app.py         # Streamlit frontend app showing dashboard & analytics
-│
-├── tests/
-│   ├── test_pdf_parser.py       # Unit tests for text extraction validation
-│   ├── test_embeddings.py       # Unit tests for vector shape and cosine similarity checks
-│   └── test_api.py              # API route testing using TestClient
-│
-├── scripts/
-│   └── seed_data.py             # Script to populate MongoDB with demo mock values
-│
-├── .env.example                 # Template for environment settings (secrets, DB URIs, S3 keys)
-├── .gitignore                   # Version control exclusions
-├── requirements.txt             # Python packages lists
-├── Dockerfile                   # Deployment containerization configurations
-├── docker-compose.yml           # Local cluster orchestration file (app, db, localstack, dashboard)
-└── .github/workflows/ci.yml     # Continuous Integration pipeline setting up PyTest
+├── worker.py                      # AI Job Agent — separate long-running process, see Architecture
+├── templates/                     # Jinja2 pages (client-hydrated shells) + static/{css,js}
+├── config/*.json                  # skills / certifications / education / experience vocab
+├── scripts/seed_data.py
+├── tests/                         # test_api.py, test_embeddings.py, test_pdf_parser.py — see
+│                                   # Known limitations below
+├── .env.example
+├── requirements.txt
+├── Dockerfile, docker-compose.yml # sketched, not finished — see Known limitations
+└── .github/workflows/ci.yml
 ```
 
 ---
 
-## Data Pipeline Flow
+## Tech stack
 
-1. **Ingestion & Storage**:
-   - User uploads a resume PDF via the Streamlit frontend.
-   - Streamlit calls the FastAPI endpoint `POST /upload-resume`.
-   - FastAPI saves the metadata in MongoDB and uploads the raw PDF to AWS S3 (via Boto3).
-   
-2. **Analysis Pipeline**:
-   - The user requests analysis via `POST /analyze`.
-   - FastAPI retrieves the PDF from S3 and extracts raw text using the PDF parser.
-   - Extracted text is normalized by the preprocessor.
-   - Text is sent through the NLP Named Entity Recognition (spaCy) to extract skills, education, and experience entities.
-   - Cleaned text is vectorized and matched against stored Job Descriptions using cosine similarity.
-   - The profile features are fed into ML models to predict job role classification and salary regression bands.
-   - The complete report is stored in MongoDB and returned to the client.
-
-3. **Dashboard Reporting**:
-   - Streamlit retrieves user uploads and pipeline histories using `GET /history/{user_id}` and renders interactive visualization charts.
+| Concern | Choice |
+|---|---|
+| API framework | FastAPI + Jinja2 (async, built-in background tasks, Pydantic validation) |
+| Database | MongoDB Atlas (flexible schema for evolving entity/job shapes) |
+| Resume entity extraction | Groq (Llama 3.3 70B) — switched off Gemini, whose free tier required billing to get any quota |
+| Matching | BGE sentence-transformers + weighted cosine similarity, not TF-IDF/keyword matching |
+| File storage | AWS S3 (presigned URLs generated fresh per download, never cached) |
+| Auth | JWT (python-jose) + bcrypt, plus Google OAuth (stateless, single-use handoff token) |
+| Scheduling | APScheduler in a separate process (`worker.py`), not Celery/Redis |
+| Job sources | Adzuna (quota-limited) + RemoteOK (free) |
+| Email | Resend → Brevo → SMTP fallback chain |
 
 ---
 
 ## Running the app
-
-*(Note: the sections above describe the original architectural blueprint and are out of date — the app is actually FastAPI + Jinja2 templates, Gemini-based NER, and BGE sentence-transformer embeddings, not Streamlit/spaCy/TF-IDF. This section reflects what's actually implemented.)*
-
-The app is two independent processes that only communicate through MongoDB — the API never starts the scheduler itself, and the worker never serves HTTP:
-
-- **Web** (`app/main.py`) — FastAPI: auth, resume upload/analyze, dashboard, history, activity, market trends, job matches, settings. No background scheduling.
-- **Worker** (`worker.py`) — runs the AI Job Agent scheduler: fetches jobs globally (Adzuna + RemoteOK) on a fixed interval, matches every registered user against the shared pool, sends the daily digest email, and updates scan state. Runs forever until stopped; safe to run more than one instance at once (a Mongo-based leader lock ensures only one actually does the work).
-
-### Development
 
 Two terminals, same `.env`:
 
@@ -115,3 +106,19 @@ worker: python worker.py
 ```
 
 Both read the same `MONGODB_URI` — no other coordination needed between them.
+
+### Environment variables
+
+See `.env.example` for the full list. At minimum you need `MONGODB_URI`, `SECRET_KEY`, AWS credentials + `AWS_BUCKET_NAME`, and `GROQ_API_KEY`. Adzuna, Google OAuth, and email provider keys are optional — each feature degrades gracefully (clear 503s / skipped sends) rather than crashing when unconfigured.
+
+---
+
+## Known limitations
+
+Kept here deliberately rather than glossed over:
+
+- **Tests are scaffolding, not implemented.** Every function in `tests/test_api.py`, `test_embeddings.py`, and `test_pdf_parser.py` is a `pass` with comments describing the intended test — running pytest reports them all as "passing," which is misleading. None actually assert anything yet.
+- **Containerization is sketched, not built.** `Dockerfile` and `docker-compose.yml` are comment-only outlines; the app currently runs as two plain local/host processes, not containers.
+- **Dead code from an earlier design.** `app/core/celery_app.py`, `app/tasks/`, and `app/database/mongodb.py` are a superseded Celery+Redis scheduling attempt — `REDIS_URL` isn't even set in `.env`. The real scheduler is `worker.py` + APScheduler.
+- **No OCR fallback.** A scanned/image-only PDF resume yields empty extracted text — there's no image-to-text fallback for non-text PDFs.
+- **Worker matching is sequential, not parallelized** — it processes registered users one at a time per scan cycle, which would need batching/parallelization to hold up at a much larger user base.
